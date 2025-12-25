@@ -16,7 +16,6 @@
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/delay.h>
-#include <linux/unaligned.h>
 #include <linux/types.h>
 #include <linux/dmi.h>
 #include <linux/fixp-arith.h>
@@ -3027,56 +3026,70 @@ static int acer_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 static int acer_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 								u32 attr, int channel, long val)
 {
+	enum acer_wmi_gaming_fan_mode mode;
+	u16 fan_bitmap;
+	u8 fan, speed;
 	acpi_status status;
 
 	switch (type) {
 		case hwmon_pwm:
 			switch (attr) {
 				case hwmon_pwm_input:
-					return WMID_gaming_set_gaming_fan_speed(acer_wmi_fan_channel_to_fan_id[channel],
-															fixp_linear_interpolate(0, 0, U8_MAX, 100, clamp_val(val, 0, U8_MAX)));
+					fan = acer_wmi_fan_channel_to_fan_id[channel];
+					speed = fixp_linear_interpolate(0, 0, U8_MAX, 100,
+													clamp_val(val, 0, U8_MAX));
 
+					return WMID_gaming_set_gaming_fan_speed(fan, speed);
 				case hwmon_pwm_enable:
-					if (val == 2) {
-						/* --- TARGET: DYNAMIC AUTO WITH 2000 RPM BASE --- */
+					fan_bitmap = acer_wmi_fan_channel_to_fan_bitmap[channel];
 
-						/* 1. Reset Master Switch (Method 2, Val 0x1) */
+					if (val == 2) {
+						/* DYNAMIC AUTO: Matches 'Modified Driver' sequence */
+
+						/* 1. Master Reset: Clear Turbo state */
 						WMI_gaming_execute_u64(2, 0x1, NULL);
 						msleep(20);
 
-						/* 2. Reset OC Bits to Normal (Method 22, Index 5 & 7, Val 0)
-						 * This is critical to prevent the 6000 RPM lock.
-						 */
+						/* 2. OC Reset: Allow fans to drop to 2000 RPM */
 						WMI_gaming_execute_u64(22, 0x005, NULL);
 						WMI_gaming_execute_u64(22, 0x007, NULL);
 						msleep(20);
 
-						/* 3. Set Profile to 'Balanced-Performance' (Index 11, Val 4)
-						 * 0x40B = Allows high speed under load, but has a low idle floor.
-						 */
+						/* 3. Balanced-Performance: Unlock the 7500 RPM ceiling */
 						WMI_gaming_execute_u64(22, 0x40B, NULL);
 						msleep(50);
 
-						/* 4. Apply Gaming Auto Curve (Value 0x410009) */
+						/* 4. Apply Gaming Auto Curve directly to Method 14 */
 						status = WMI_gaming_execute_u64(14, 0x410009, NULL);
+						if (ACPI_FAILURE(status))
+							return -EIO;
+
+						return 0;
 
 					} else if (val == 0) {
-						/* FULL TURBO MAX SPEED */
+						/* FULL TURBO: Forces max speed instantly */
 						WMI_gaming_execute_u64(2, 0x10001, NULL);
 						WMI_gaming_execute_u64(22, 0x205, NULL);
 						WMI_gaming_execute_u64(22, 0x207, NULL);
 						WMI_gaming_execute_u64(22, 0x50B, NULL);
 						msleep(50);
+
+						/* Force Max Curve directly to Method 14 */
 						status = WMI_gaming_execute_u64(14, 0x820009, NULL);
+						if (ACPI_FAILURE(status))
+							return -EIO;
+
+						return 0;
+
+					} else if (val == 1) {
+						/* Manual/Custom Mode */
+						mode = ACER_WMID_FAN_MODE_CUSTOM;
 					} else {
-						/* Manual Mode */
-						status = WMI_gaming_execute_u64(14, 0xC30009, NULL);
+						return -EINVAL;
 					}
 
-					if (ACPI_FAILURE(status))
-						return -EIO;
-				return 0;
-
+					/* Fallback for standard custom mode behavior */
+					return WMID_gaming_set_fan_behavior(fan_bitmap, mode);
 				default:
 					return -EOPNOTSUPP;
 			}

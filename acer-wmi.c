@@ -3023,6 +3023,14 @@ static int acer_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	}
 }
 
+/**
+ * acer_wmi_hwmon_write() - Callback to handle writes to fan-related sysfs attributes.
+ * @dev: The device being written to.
+ * @type: Sensor type (hwmon_pwm for fans).
+ * @attr: The attribute type (input for manual speed, enable for modes).
+ * @channel: The fan index (0 for CPU, 1 for GPU).
+ * @val: The value written from userspace (0=Turbo, 1=Custom, 2=Auto, or PWM 0-255).
+ */
 static int acer_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 								u32 attr, int channel, long val)
 {
@@ -3034,47 +3042,71 @@ static int acer_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type
 	switch (type) {
 		case hwmon_pwm:
 			switch (attr) {
+				/* Case for 'pwmX' files: Manual speed control (0-255) */
 				case hwmon_pwm_input:
+					/* Map Linux channel index (0/1) to Acer Hardware Fan ID (1/4) */
 					fan = acer_wmi_fan_channel_to_fan_id[channel];
+
+					/* Convert Linux PWM range (0-255) to Hardware percentage (0-100%) */
 					speed = fixp_linear_interpolate(0, 0, U8_MAX, 100,
 													clamp_val(val, 0, U8_MAX));
 
+					/* Write speed percentage to firmware Method ID 16 */
 					return WMID_gaming_set_gaming_fan_speed(fan, speed);
+
+				/* Case for 'pwmX_enable' files: Mode switching */
 				case hwmon_pwm_enable:
+					/* Bitmask representing which fans to apply settings to */
 					fan_bitmap = acer_wmi_fan_channel_to_fan_bitmap[channel];
 
 					if (val == 2) {
-						/* DYNAMIC AUTO: Matches 'Modified Driver' sequence */
+						/**
+						 * DYNAMIC AUTO MODE (Gaming Curve)
+						 * Replicates NitroSense "Gaming Auto" logic.
+						 */
 
-						/* 1. Master Reset: Clear Turbo state */
+						/* 1. Reset Master Switch: Disable Turbo state/LED (Method 2, Val 0x1) */
 						WMI_gaming_execute_u64(2, 0x1, NULL);
 						msleep(20);
 
-						/* 2. OC Reset: Allow fans to drop to 2000 RPM */
+						/* 2. OC Reset: Clear Overclocking indices (Method 22, Indices 5 & 7, Val 0)
+						 * This releases the voltage floor, allowing fans to drop to ~2000 RPM.
+						 */
 						WMI_gaming_execute_u64(22, 0x005, NULL);
 						WMI_gaming_execute_u64(22, 0x007, NULL);
 						msleep(20);
 
-						/* 3. Balanced-Performance: Unlock the 7500 RPM ceiling */
+						/* 3. Balanced-Performance: Unlock ceiling (Method 22, Index 11, Val 4)
+						 * Profile 0x4 enables aggressive ramping up to 7500 RPM under load.
+						 */
 						WMI_gaming_execute_u64(22, 0x40B, NULL);
 						msleep(50);
 
-						/* 4. Apply Gaming Auto Curve directly to Method 14 */
+						/* 4. Apply Gaming Curve: Direct write to Method 14 (Val 0x410009) */
 						status = WMI_gaming_execute_u64(14, 0x410009, NULL);
 						if (ACPI_FAILURE(status))
 							return -EIO;
 
-						return 0;
+					return 0;
 
 					} else if (val == 0) {
-						/* FULL TURBO: Forces max speed instantly */
+						/**
+						 * FULL TURBO MODE (Maximum Cooling)
+						 * Forces hardware flags to maximum, overriding thermal curves.
+						 */
+
+						/* 1. Set Turbo LED to ON (Method 2, Val 0x10001) */
 						WMI_gaming_execute_u64(2, 0x10001, NULL);
+
+						/* 2. Enable OC: Bits 1 & 2 to Turbo (Method 22, Indices 5 & 7, Val 2) */
 						WMI_gaming_execute_u64(22, 0x205, NULL);
 						WMI_gaming_execute_u64(22, 0x207, NULL);
+
+						/* 3. Force Global Profile to Turbo (Method 22, Index 11, Val 5) */
 						WMI_gaming_execute_u64(22, 0x50B, NULL);
 						msleep(50);
 
-						/* Force Max Curve directly to Method 14 */
+						/* 4. Apply Fixed Max Curve: Direct write to Method 14 (Val 0x820009) */
 						status = WMI_gaming_execute_u64(14, 0x820009, NULL);
 						if (ACPI_FAILURE(status))
 							return -EIO;
@@ -3082,19 +3114,23 @@ static int acer_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type
 						return 0;
 
 					} else if (val == 1) {
-						/* Manual/Custom Mode */
+						/* Manual/Custom Mode: Allows user to use the pwmX_input slider */
 						mode = ACER_WMID_FAN_MODE_CUSTOM;
 					} else {
 						return -EINVAL;
 					}
 
-					/* Fallback for standard custom mode behavior */
+					/**
+					 * Fallback: Use standard driver helper for standard custom behavior.
+					 * Sends the calculated mode/bitmap to Method ID 14.
+					 */
 					return WMID_gaming_set_fan_behavior(fan_bitmap, mode);
+
 				default:
 					return -EOPNOTSUPP;
 			}
-				default:
-					return -EOPNOTSUPP;
+			default:
+				return -EOPNOTSUPP;
 	}
 }
 

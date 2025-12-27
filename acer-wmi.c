@@ -3024,114 +3024,83 @@ static int acer_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 }
 
 /**
- * acer_wmi_hwmon_write() - Callback to handle writes to fan-related sysfs attributes.
- * @dev: The device being written to.
- * @type: Sensor type (hwmon_pwm for fans).
- * @attr: The attribute type (input for manual speed, enable for modes).
- * @channel: The fan index (0 for CPU, 1 for GPU).
- * @val: The value written from userspace (0=Turbo, 1=Custom, 2=Auto, or PWM 0-255).
+ * acer_wmi_hwmon_write() - Sysfs write handler for Acer Nitro fan control.
+ * @dev: Hwmon device pointer.
+ * @type: Sensor type (must be hwmon_pwm).
+ * @attr: Attribute (input/enable).
+ * @channel: Fan index (0=CPU, 1=GPU).
+ * @val: Mode/Speed value.
  */
 static int acer_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 								u32 attr, int channel, long val)
 {
-	enum acer_wmi_gaming_fan_mode mode;
 	u16 fan_bitmap;
 	u8 fan, speed;
 	acpi_status status;
 
-	switch (type) {
-		case hwmon_pwm:
-			switch (attr) {
-				/* Case for 'pwmX' files: Manual speed control (0-255) */
-				case hwmon_pwm_input:
-					/* Map Linux channel index (0/1) to Acer Hardware Fan ID (1/4) */
-					fan = acer_wmi_fan_channel_to_fan_id[channel];
+	/* Guard: Return early if the sensor type is not PWM.
+	 * This aligns with kernel best practices by reducing indentation.
+	 */
+	if (type != hwmon_pwm)
+		return -EOPNOTSUPP;
 
-					/* Convert Linux PWM range (0-255) to Hardware percentage (0-100%) */
-					speed = fixp_linear_interpolate(0, 0, U8_MAX, 100,
-													clamp_val(val, 0, U8_MAX));
+	/* Handle Manual Speed Control: echo [0-255] > pwmX */
+	if (attr == hwmon_pwm_input) {
+		fan = acer_wmi_fan_channel_to_fan_id[channel];
+		speed = fixp_linear_interpolate(0, 0, U8_MAX, 100,
+										clamp_val(val, 0, U8_MAX));
 
-					/* Write speed percentage to firmware Method ID 16 */
-					return WMID_gaming_set_gaming_fan_speed(fan, speed);
-
-				/* Case for 'pwmX_enable' files: Mode switching */
-				case hwmon_pwm_enable:
-					/* Bitmask representing which fans to apply settings to */
-					fan_bitmap = acer_wmi_fan_channel_to_fan_bitmap[channel];
-
-					if (val == 2) {
-						/**
-						 * DYNAMIC AUTO MODE (Gaming Curve)
-						 * Replicates NitroSense "Gaming Auto" logic.
-						 */
-
-						/* 1. Reset Master Switch: Disable Turbo state/LED (Method 2, Val 0x1) */
-						WMI_gaming_execute_u64(2, 0x1, NULL);
-						msleep(20);
-
-						/* 2. OC Reset: Clear Overclocking indices (Method 22, Indices 5 & 7, Val 0)
-						 * This releases the voltage floor, allowing fans to drop to ~2000 RPM.
-						 */
-						WMI_gaming_execute_u64(22, 0x005, NULL);
-						WMI_gaming_execute_u64(22, 0x007, NULL);
-						msleep(20);
-
-						/* 3. Balanced-Performance: Unlock ceiling (Method 22, Index 11, Val 4)
-						 * Profile 0x4 enables aggressive ramping up to 7500 RPM under load.
-						 */
-						WMI_gaming_execute_u64(22, 0x40B, NULL);
-						msleep(50);
-
-						/* 4. Apply Gaming Curve: Direct write to Method 14 (Val 0x410009) */
-						status = WMI_gaming_execute_u64(14, 0x410009, NULL);
-						if (ACPI_FAILURE(status))
-							return -EIO;
-
-					return 0;
-
-					} else if (val == 0) {
-						/**
-						 * FULL TURBO MODE (Maximum Cooling)
-						 * Forces hardware flags to maximum, overriding thermal curves.
-						 */
-
-						/* 1. Set Turbo LED to ON (Method 2, Val 0x10001) */
-						WMI_gaming_execute_u64(2, 0x10001, NULL);
-
-						/* 2. Enable OC: Bits 1 & 2 to Turbo (Method 22, Indices 5 & 7, Val 2) */
-						WMI_gaming_execute_u64(22, 0x205, NULL);
-						WMI_gaming_execute_u64(22, 0x207, NULL);
-
-						/* 3. Force Global Profile to Turbo (Method 22, Index 11, Val 5) */
-						WMI_gaming_execute_u64(22, 0x50B, NULL);
-						msleep(50);
-
-						/* 4. Apply Fixed Max Curve: Direct write to Method 14 (Val 0x820009) */
-						status = WMI_gaming_execute_u64(14, 0x820009, NULL);
-						if (ACPI_FAILURE(status))
-							return -EIO;
-
-						return 0;
-
-					} else if (val == 1) {
-						/* Manual/Custom Mode: Allows user to use the pwmX_input slider */
-						mode = ACER_WMID_FAN_MODE_CUSTOM;
-					} else {
-						return -EINVAL;
-					}
-
-					/**
-					 * Fallback: Use standard driver helper for standard custom behavior.
-					 * Sends the calculated mode/bitmap to Method ID 14.
-					 */
-					return WMID_gaming_set_fan_behavior(fan_bitmap, mode);
-
-				default:
-					return -EOPNOTSUPP;
-			}
-			default:
-				return -EOPNOTSUPP;
+		return WMID_gaming_set_gaming_fan_speed(fan, speed);
 	}
+
+	/* Guard: Only proceed if we are modifying the fan mode (pwmX_enable) */
+	if (attr != hwmon_pwm_enable)
+		return -EOPNOTSUPP;
+
+	/* Validate userspace input range [0=Turbo, 1=Custom, 2=Auto] */
+	if (val < 0 || val > 2)
+		return -EINVAL;
+
+	fan_bitmap = acer_wmi_fan_channel_to_fan_bitmap[channel];
+
+	/* --- MODE 2: DYNAMIC AUTO (Balanced-Performance) ---
+	 * On AN515-58, this profile is the "gatekeeper" for the 7500 RPM range.
+	 */
+	if (val == 2) {
+		/* Step 1: Reset hardware switches to release RPM floor locks */
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_LED_METHODID, 0x1, NULL);
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_MISC_SETTING_METHODID, 0x005, NULL);
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_MISC_SETTING_METHODID, 0x007, NULL);
+		msleep(20);
+
+		/* Step 2: Set Profile 0x40B (Balanced-Performance).
+		 * This profile enables the 2000 RPM idle to 7500 RPM max range.
+		 */
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_MISC_SETTING_METHODID, 0x40B, NULL);
+		msleep(50); /* Mandatory delay for Embedded Controller to switch tables */
+
+		/* Step 3: Activate the Dynamic Gaming Curve via Method 14 */
+		status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID, 0x410009, NULL);
+		return ACPI_FAILURE(status) ? -EIO : 0;
+	}
+
+	/* --- MODE 0: FULL TURBO (Fixed Maximum) --- */
+	if (val == 0) {
+		/* Enable Turbo LED, OC Power Bits, and Performance Profile (0x50B) */
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_LED_METHODID, 0x10001, NULL);
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_MISC_SETTING_METHODID, 0x205, NULL);
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_MISC_SETTING_METHODID, 0x207, NULL);
+		WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_MISC_SETTING_METHODID, 0x50B, NULL);
+		msleep(50);
+
+		/* Override all logic with Fixed Max Curve (0x820009) */
+		status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID, 0x820009, NULL);
+		return ACPI_FAILURE(status) ? -EIO : 0;
+	}
+
+	/* --- MODE 1: CUSTOM (Manual Mode) --- */
+	/* Fallback to standard driver helper for manual PWM control */
+	return WMID_gaming_set_fan_behavior(fan_bitmap, ACER_WMID_FAN_MODE_CUSTOM);
 }
 
 static const struct hwmon_channel_info *const acer_wmi_hwmon_info[] = {

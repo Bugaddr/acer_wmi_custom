@@ -3032,76 +3032,63 @@ static int acer_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
  * @val: Mode/Speed value.
  */
 static int acer_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
-								u32 attr, int channel, long val)
+                                u32 attr, int channel, long val)
 {
-	u8 fan, speed;
-	acpi_status status;
+    u16 fan_bitmap;
+    u8 fan, speed;
+    acpi_status status;
 
-	/* We only support PWM (Fan Control) attributes */
-	if (type != hwmon_pwm)
-		return -EOPNOTSUPP;
+    if (type != hwmon_pwm)
+        return -EOPNOTSUPP;
 
-	/* 1. Handle Manual Speed (pwmX) */
-	if (attr == hwmon_pwm_input) {
-		/* Map channel to internal Fan ID (1=CPU, 4=GPU) */
-		fan = (channel == 0) ? 1 : 4;
+    switch (attr) {
+    case hwmon_pwm_input:
+        /* Use the driver's mapping array: 0 -> CPU (1), 1 -> GPU (4) */
+        fan = acer_wmi_fan_channel_to_fan_id[channel];
 
-		/* Scale sysfs 0-255 to Acer 0-100% */
-		speed = fixp_linear_interpolate(0, 0, 255, 100, clamp_val(val, 0, 255));
+        /* Map sysfs 0-255 to Acer 0-100% */
+        speed = fixp_linear_interpolate(0, 0, 255, 100, clamp_val(val, 0, 255));
 
-		/* Uses Method 16 (SET_GAMING_FAN_SPEED) */
-		return WMID_gaming_set_gaming_fan_speed(fan, speed);
-	}
+        return WMID_gaming_set_gaming_fan_speed(fan, speed);
 
-	/* 2. Handle Mode Switch (pwmX_enable) */
-	if (attr != hwmon_pwm_enable)
-		return -EOPNOTSUPP;
+    case hwmon_pwm_enable:
+        /* Standard hwmon: 0=Turbo/Full, 1=Manual, 2=Auto */
+        if (val < 0 || val > 2)
+            return -EINVAL;
 
-	/* Validate input: 0=Turbo, 1=Manual, 2=Auto */
-	if (val < 0 || val > 2)
-		return -EINVAL;
+        /* --- AUTO MODE (2) --- */
+        if (val == 2) {
+            /* Reset OC locks */
+            WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_OC_1, ACER_WMID_OC_NORMAL);
+            WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_OC_2, ACER_WMID_OC_NORMAL);
+            
+            /* Set Platform to Balanced */
+            WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
+                                         ACER_PREDATOR_V4_THERMAL_PROFILE_BALANCED);
+            
+            /* Command 0x410009: Restore EC Auto-Control */
+            status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID, 0x410009, NULL);
+            return ACPI_FAILURE(status) ? -EIO : 0;
+        }
 
-	/* --- MODE 2: AUTO (Balanced) --- */
-	if (val == 2) {
-		/* Step A: Clear Overclocking locks in the EC */
-		WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_OC_1, ACER_WMID_OC_NORMAL);
-		WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_OC_2, ACER_WMID_OC_NORMAL);
-		msleep(20);
+        /* --- TURBO MODE (0) --- */
+        if (val == 0) {
+            WMID_gaming_set_u64(0x10001, ACER_CAP_TURBO_LED);
+            WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
+                                         ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO);
+            
+            /* Command 0x820009: Force Max Speed */
+            status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID, 0x820009, NULL);
+            return ACPI_FAILURE(status) ? -EIO : 0;
+        }
 
-		/* Step B: Switch to Balanced Platform Profile (0x04)
-		 * This changes the ACPI _PPC and T-States.
-		 */
-		WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
-									 ACER_PREDATOR_V4_THERMAL_PROFILE_BALANCED);
-		msleep(50);
+        /* --- MANUAL MODE (1) --- */
+        fan_bitmap = acer_wmi_fan_channel_to_fan_bitmap[channel];
+        return WMID_gaming_set_fan_behavior(fan_bitmap, ACER_WMID_FAN_MODE_CUSTOM);
 
-		/* Step C: Send the 'Balanced' Fan Behavior Code (0x410009)
-		 * 0x09 is the 'Global Behavior' command in WFTB logic.
-		 */
-		status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID, 0x410009, NULL);
-		return ACPI_FAILURE(status) ? -EIO : 0;
-	}
-
-	/* --- MODE 0: TURBO (Max Speed) --- */
-	if (val == 0) {
-		/* Step A: Enable Turbo LED (Method 2) */
-		WMID_gaming_set_u64(0x10001, ACER_CAP_TURBO_LED);
-
-		/* Step B: Set Performance Platform Profile (0x05) */
-		WMID_gaming_set_misc_setting(ACER_WMID_MISC_SETTING_PLATFORM_PROFILE,
-									 ACER_PREDATOR_V4_THERMAL_PROFILE_TURBO);
-		msleep(50);
-
-		/* Step C: Send the 'Turbo' Fan Behavior Code (0x820009)
-		 * Bit 7 of the profile byte (0x80) acts as the 'Force Max' flag.
-		 */
-		status = WMI_gaming_execute_u64(ACER_WMID_SET_GAMING_FAN_BEHAVIOR_METHODID, 0x820009, NULL);
-		return ACPI_FAILURE(status) ? -EIO : 0;
-	}
-
-	/* --- MODE 1: MANUAL --- */
-	/* Fallback to custom mode which allows Method 16 to work */
-	return WMID_gaming_set_fan_behavior(0, ACER_WMID_FAN_MODE_CUSTOM);
+    default:
+        return -EOPNOTSUPP;
+    }
 }
 
 static const struct hwmon_channel_info *const acer_wmi_hwmon_info[] = {

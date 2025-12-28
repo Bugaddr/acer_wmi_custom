@@ -1,4 +1,9 @@
-# Summary of Modes
+# Modified acer-wmi driver
+
+1. Fixed fan control for acer AN515-58
+
+
+## Summary of Modes
 
 The acer-wmi driver for your Nitro AN515-58 supports three specific modes for pwm1_enable:
 
